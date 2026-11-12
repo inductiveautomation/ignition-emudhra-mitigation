@@ -168,13 +168,14 @@ from java.lang import System
 print(System.getProperty("java.home"))
 ```
 
-On a gateway fixed with the script, the runtime folder's name contains `.20261028`, for example `.../runtimes/17.0.20.1.20261028.aarch64`. Without it, the gateway hasn't been restarted since the script ran, or the Designer hasn't been relaunched.
+On a gateway fixed with the script, the runtime folder's name contains `.20261111`, for example `.../runtimes/17.0.20.1.20261111.aarch64`. Without it, the gateway hasn't been restarted since the script ran, or the Designer hasn't been relaunched.
 
 ## When to repeat these steps
 
 - **After upgrading the gateway:** the upgrade replaces the gateway's runtime, including `cacerts`, the runtimes it hands out, and the runtime version.
 - **On a workstation, whenever the Designer or a Vision Client downloads a new runtime from a gateway that wasn't fixed with the script,** for example one fixed by hand or with the Docker mounts. That happens on a new workstation, for a new user, after the cache is cleared, or after a gateway upgrade.
 - **After upgrading or reinstalling a launcher.**
+- **On a Windows gateway where version 2.0.0 of the script ran:** run the current version. Version 2.0.0 left the Windows runtime the gateway hands out in a form the launchers can't unpack, so Windows Designers and Vision Clients fail to start with `ZipException: only DEFLATED entries can have EXT descriptor`. The current version rebuilds that archive and reports it as `repaired:`. Run it even if you restored `jre-win.zip.orig` to get clients working: every Designer and Vision Client then downloads the fixed runtime once more, including any that downloaded the unfixed one.
 
 You can stop repeating these steps once you install an Ignition release whose bundled Java includes the fix. We will announce which release that is.
 
@@ -222,10 +223,11 @@ flowchart TD
     ar["<b>2 · On a gateway: each runtime archive it hands out</b><br/>jre-*.tar.gz and jre-*.zip in lib/runtime<br/><br/>Read the cacerts inside, with the gateway's own java"] --> need{"Roots<br/>present?"}
     need -- "can't read" --> af["failed"]
     need -- no --> ao["already patched"]
+    need -- "no, but a .zip that Java can't unpack (Windows script)" --> afix
     need -- yes --> afix["Build a patched copy beside it and check it: same entries, cacerts lost only the roots"]
     afix -- "check passes" --> aswap["Keep the archive's .orig (first time). Rename the copy over the archive"]
     afix -- "check fails" --> af2["failed, archive untouched"]
-    aswap --> ad["patched"]
+    aswap --> ad["patched, or repaired"]
     af & ao & ad & af2 --> v{"All archives<br/>OK?"}
     v -- yes --> vs["Add a suffix to the runtime version (keep version.orig) so clients download the patched runtime"]
     vs --> mk{"Its own runtime fixed,<br/>at the same version?"}

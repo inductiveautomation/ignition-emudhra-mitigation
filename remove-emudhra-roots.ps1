@@ -14,7 +14,7 @@
 # earlier version of this script needs changing again, along with the shell
 # script and the folder name in README.md's "Check that it worked".
 # Digits only: older launchers reject any other character in a version.
-$runtimeSuffix = '20261028'
+$runtimeSuffix = '20261111'
 
 $roots = @("$env:ProgramFiles\Inductive Automation")
 foreach ($user in Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue) {
@@ -292,15 +292,16 @@ function Read-Zip([string]$Path, [string[]]$Names) {
   }
 }
 
-# Copies the .zip at $Path to $OutFile and rewrites the entries in $Replace, a
-# table of entry name to new bytes, so entry order is unchanged. Writes a
-# fresh archive rather than editing one in place with ZipArchiveMode.Update:
-# when an entry's size changes, Update mode rewrites every entry after it on
-# Dispose, and that rewrite can leave zero-length Stored entries, i.e.
-# directories, flagged as if a data descriptor follows them even though none
-# does. .NET's own reader doesn't mind, but Java's ZipInputStream rejects the
-# result with "only DEFLATED entries can have EXT descriptor", which breaks
-# every Designer and Vision Client launcher that unpacks the archive.
+# Copies the .zip at $Path to $OutFile, replacing the entries in $Replace, a
+# table of entry name to new bytes, and keeping entry order. It writes a new
+# archive rather than editing a copy with ZipArchiveMode.Update. Java builds
+# these archives with every entry, directories included, compressed and
+# flagged as followed by a data descriptor. In Update mode, .NET, in Windows
+# PowerShell and PowerShell 7 alike, rewrites every entry and stores the empty
+# ones, the directories, uncompressed, but keeps that flag. Java's
+# ZipInputStream, which the launchers unpack the runtime with, rejects such an
+# entry with "only DEFLATED entries can have EXT descriptor". Create mode,
+# writing to a file, never sets the flag.
 function Update-Zip([string]$Path, [hashtable]$Replace, [string]$OutFile) {
   if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
   $inZip = [IO.Compression.ZipFile]::OpenRead($Path)
@@ -310,7 +311,6 @@ function Update-Zip([string]$Path, [hashtable]$Replace, [string]$OutFile) {
       foreach ($entry in $inZip.Entries) {
         $newEntry = $outZip.CreateEntry($entry.FullName, [IO.Compression.CompressionLevel]::Optimal)
         $newEntry.LastWriteTime = $entry.LastWriteTime
-        $newEntry.ExternalAttributes = $entry.ExternalAttributes
         $out = $newEntry.Open()
         try {
           if ($Replace.ContainsKey($entry.FullName)) {
@@ -332,6 +332,49 @@ function Update-Zip([string]$Path, [hashtable]$Replace, [string]$OutFile) {
   }
 }
 
+# True when the .zip at $Path has an entry Java's ZipInputStream rejects:
+# stored uncompressed, yet flagged as followed by a data descriptor. Version
+# 2.0.0 of this script, which edited archives in Update mode, left every
+# directory entry of the .zip it patched that way. Java reads the flag from
+# each entry's local header, so this does too, finding the headers through the
+# central directory.
+function Test-ZipNeedsRepair([string]$Path) {
+  $file = [IO.File]::OpenRead($Path)
+  try {
+    # The end of central directory record is 22 bytes, plus a comment of up to
+    # 65535. It holds the entry count at 10, and the central directory's size
+    # at 12 and offset at 16.
+    $tailLength = [int][Math]::Min($file.Length, 65557)
+    $tail = New-Object byte[] $tailLength
+    $null = $file.Seek(-$tailLength, [IO.SeekOrigin]::End)
+    Read-Exactly $file $tail $tailLength
+    $end = $tailLength - 22
+    while ($end -ge 0 -and [BitConverter]::ToUInt32($tail, $end) -ne 0x06054b50) { $end-- }
+    if ($end -lt 0) { throw 'no zip central directory' }
+    $count = [BitConverter]::ToUInt16($tail, $end + 10)
+    $size = [BitConverter]::ToUInt32($tail, $end + 12)
+    $directory = New-Object byte[] $size
+    $null = $file.Seek([BitConverter]::ToUInt32($tail, $end + 16), [IO.SeekOrigin]::Begin)
+    Read-Exactly $file $directory $size
+    # A central directory header has the lengths of the name, extra field and
+    # comment that follow it at 28, 30 and 32, and the local header's offset
+    # at 42. A local header has the flags at 6 and the compression method at 8.
+    $local = New-Object byte[] 10
+    $p = 0
+    for ($i = 0; $i -lt $count; $i++) {
+      if ([BitConverter]::ToUInt32($directory, $p) -ne 0x02014b50) { throw 'unexpected zip central directory' }
+      $null = $file.Seek([BitConverter]::ToUInt32($directory, $p + 42), [IO.SeekOrigin]::Begin)
+      Read-Exactly $file $local 10
+      if (([BitConverter]::ToUInt16($local, 6) -band 8) -and [BitConverter]::ToUInt16($local, 8) -eq 0) { return $true }
+      $p += 46 + [BitConverter]::ToUInt16($directory, $p + 28) + [BitConverter]::ToUInt16($directory, $p + 30) +
+        [BitConverter]::ToUInt16($directory, $p + 32)
+    }
+    return $false
+  } finally {
+    $file.Dispose()
+  }
+}
+
 # Returns the java of the gateway's own runtime in the lib\runtime folder at
 # $Dir. It edits the cacerts inside the archives, whichever OS they are for.
 function Get-GatewayJava([string]$Dir) {
@@ -346,9 +389,10 @@ function Get-GatewayJava([string]$Dir) {
 }
 
 # Patches the runtime inside one archive: removes our roots from its cacerts,
-# using the java at $Java. The result is checked before it replaces the
-# original, which is kept as .orig. Returns $true when the archive needed no
-# change.
+# using the java at $Java, or rebuilds a .zip whose roots are gone but that
+# Java can't unpack. The result is checked before it replaces the original,
+# which is kept as .orig. Returns what it did: 'already patched', 'patched' or
+# 'repaired'.
 function Update-Archive([IO.FileInfo]$Archive, [string]$Java) {
   $top = $Archive.Name -replace '\.(tar\.gz|zip)$', ''
   $ca = "$top/lib/security/cacerts"
@@ -361,7 +405,8 @@ function Update-Archive([IO.FileInfo]$Archive, [string]$Java) {
     [IO.File]::WriteAllBytes($ks, $before.Members[$ca])
     $aliases = @(Get-RootAlias $Java $ks)
     $entryCount = Get-EntryCount $Java $ks
-    if ($aliases.Count -eq 0) { return $true }
+    $repair = $aliases.Count -eq 0 -and $isZip -and (Test-ZipNeedsRepair $Archive.FullName)
+    if ($aliases.Count -eq 0 -and -not $repair) { return 'already patched' }
 
     Remove-RootAlias $Java $ks $aliases
     $replace = @{ $ca = [IO.File]::ReadAllBytes($ks) }
@@ -369,6 +414,7 @@ function Update-Archive([IO.FileInfo]$Archive, [string]$Java) {
       Update-Zip $Archive.FullName $replace $new
       $after = Read-Zip $new @($ca)
       if ($after.Names -ne $before.Names) { throw 'entries changed' }
+      if (Test-ZipNeedsRepair $new) { throw "Java couldn't unpack the patched copy" }
     } else {
       $null = Copy-TarGz $Archive.FullName @($ca) $replace $new
       $after = Copy-TarGz $new @($ca) @{} $null
@@ -384,7 +430,7 @@ function Update-Archive([IO.FileInfo]$Archive, [string]$Java) {
     # A client downloading the archive meanwhile gets either the whole old one
     # or the whole new one.
     Move-NewOver $Archive.FullName
-    return $false
+    if ($repair) { return 'repaired' } else { return 'patched' }
   } finally {
     Remove-Item $new, $ks -Force -ErrorAction SilentlyContinue
   }
@@ -444,11 +490,8 @@ foreach ($root in $roots | Where-Object { Test-Path $_ }) {
       foreach ($archive in $archives) {
         try {
           if (-not $gatewayJava) { $gatewayJava = Get-GatewayJava $dir }
-          if (Update-Archive $archive $gatewayJava) {
-            Write-Output "already patched: $($archive.FullName)"
-          } else {
-            Write-Output "patched: $($archive.FullName)"
-          }
+          $done = Update-Archive $archive $gatewayJava
+          Write-Output "${done}: $($archive.FullName)"
         } catch {
           Write-Warning "failed: $($archive.FullName) ($($_.Exception.Message))"
           $allPatched = $false
