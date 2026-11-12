@@ -15,7 +15,7 @@ set -eu
 # earlier version of this script needs changing again, along with the
 # PowerShell script and the folder name in README.md's "Check that it
 # worked". Digits only: older launchers reject any other character in a version.
-RUNTIME_SUFFIX=20261028
+RUNTIME_SUFFIX=20261111
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 trap 'exit 1' INT TERM
